@@ -19,6 +19,8 @@ static class Program
     {
         bool ncm = !args.Contains("--legacy");   // NCM batches frames per USB transfer
         bool verbose = args.Contains("-v");
+        // Every packet of the PC's traffic passes through here: do not queue behind busy processes.
+        System.Diagnostics.Process.GetCurrentProcess().PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; Environment.Exit(0); };
         using var tap = Tap.Open(AdapterName);
         Log($"adapter '{AdapterName}' open");

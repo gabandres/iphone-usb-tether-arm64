@@ -15,7 +15,9 @@ if ($LASTEXITCODE) { throw 'publish failed' }
 
 $action = New-ScheduledTaskAction -Execute "$dir\iphone-tether.exe"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+# Priority 4 = normal. The task default (7) is below normal for CPU and I/O, which starves the
+# bridge on a busy machine: ping to the phone went from 1 ms to hundreds.
+$settings = New-ScheduledTaskSettingsSet -Priority 4 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
