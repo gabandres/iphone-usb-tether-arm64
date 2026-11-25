@@ -34,10 +34,15 @@ phone was about 1 ms (max 6) over USB against about 16 ms (max 38) over Wi-Fi.
 1. Install Apple Devices, open it once, plug in the phone and trust the PC.
 2. Elevated, with the phone connected: `scripts\install-driver.ps1`
 3. Elevated, once: `scripts\install-tap.ps1`
-4. `dotnet run -c Release --project src\IphoneTether -- -v` to try it, or
-   `scripts\install-autostart.ps1` to run it hidden at every logon.
+4. `scripts\install-autostart.ps1` to run it at every logon. The bridge has no window; it logs to
+   `%LOCALAPPDATA%\iphone-usb-tether\bridge.log` (`-v` adds traffic counters every 5 seconds).
 
 The "iPhone USB" adapter goes up when the phone has carrier and gets its address from the phone.
+**The phone must be unlocked once after each plug-in.** Until then iOS holds USB data back: the
+phone reports carrier but passes no frames, and Apple's mux service lists no device. The bridge keeps
+retrying and connects as soon as the phone is unlocked. To avoid the unlock, allow wired accessories
+while locked in the phone's settings (Privacy & Security > Wired Accessories, or on older iOS
+Face ID & Passcode > Allow Access When Locked > Accessories).
 
 ## What the scripts change
 
@@ -67,4 +72,6 @@ driver:
 - Phone to host: NCM transfer blocks (`NCMH`/`NCM0`), or with `--legacy` one frame per transfer
   behind two padding bytes. Host to phone: one bare Ethernet frame per transfer.
 
-`tools\probe.py` dumps the MAC, carrier state and first transfers for debugging.
+Debugging tools: `tools\probe.py` dumps the MAC, carrier state and first transfers;
+`tools\muxlist.py` shows what Apple's mux service sees; `tools\truststate.py` asks the phone whether
+it accepts this PC's pairing record.

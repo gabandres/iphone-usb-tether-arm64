@@ -69,6 +69,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ncm", action="store_true", help="send ENABLE_NCM before reading")
     ap.add_argument("--reads", type=int, default=5)
+    ap.add_argument("--ncm-first", action="store_true", help="send ENABLE_NCM before selecting the alternate setting")
     ap.add_argument("--alt", type=int, default=1)
     a = ap.parse_args()
 
@@ -83,11 +84,14 @@ def main():
 
     mac, err = control(h, True, CMD_GET_MACADDR, 6)
     print("mac:", mac.hex(":") if mac else f"error {err}")
-    if a.ncm:
+    if a.ncm and a.ncm_first:
         _, err = control(h, False, CMD_ENABLE_NCM)
-        print("enable ncm:", "ok" if not err else f"error {err}")
+        print("enable ncm (before alt):", "ok" if not err else f"error {err}")
     if not wu.WinUsb_SetCurrentAlternateSetting(h, a.alt):
         fail("SetCurrentAlternateSetting")
+    if a.ncm and not a.ncm_first:
+        _, err = control(h, False, CMD_ENABLE_NCM)
+        print("enable ncm (after alt):", "ok" if not err else f"error {err}")
     car, err = control(h, True, CMD_CARRIER_CHECK, 3)
     print("carrier:", car.hex() if car else f"error {err}", "(04 = on)")
 

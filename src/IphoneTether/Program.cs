@@ -10,6 +10,10 @@ namespace IphoneTether;
 static class Program
 {
     const string AdapterName = "iPhone USB";
+    const int SettleMs = 10_000;
+    const int SilenceLimitMs = 30_000;
+    static readonly string LogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "iphone-usb-tether", "bridge.log");
 
     static int Main(string[] args)
     {
@@ -18,16 +22,31 @@ static class Program
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; Environment.Exit(0); };
         using var tap = Tap.Open(AdapterName);
         Log($"adapter '{AdapterName}' open");
+        // Give the phone time after every arrival or lost link before opening it again.
+        bool settle = false;
         while (true)
         {
             try
             {
+                if (!Phone.Present()) { settle = true; throw new PhoneNotFoundException(); }
+                if (settle)
+                {
+                    Log("phone arrived, letting it settle");
+                    Thread.Sleep(SettleMs);
+                    settle = false;
+                }
                 using var phone = Phone.Open(ncm);
                 Log($"phone connected, host MAC {Convert.ToHexString(phone.Mac)}, {(ncm ? "NCM" : "legacy")} framing");
                 Run(phone, tap, verbose);
             }
             catch (PhoneNotFoundException) { }
-            catch (Exception e) { Log($"link down: {e.Message}"); }
+            catch (Exception e)
+            {
+                Log($"link down: {e.Message}");
+                // Still plugged in but silent: iOS holds USB data back until the phone is unlocked.
+                if (Phone.Present()) Log("phone is connected but passes no traffic: unlock it (retrying)");
+                settle = true;
+            }
             tap.SetConnected(false);
             Thread.Sleep(2000);
         }
@@ -37,6 +56,7 @@ static class Program
     {
         using var stop = new CancellationTokenSource();
         Exception? failure = null;
+        long lastRx = Environment.TickCount64;
         long rxFrames = 0, txFrames = 0, rxBytes = 0, txBytes = 0;
         void Guard(Action body)
         {
@@ -50,6 +70,7 @@ static class Program
             while (!stop.IsCancellationRequested)
             {
                 int n = phone.Read(buf);
+                Volatile.Write(ref lastRx, Environment.TickCount64);
                 Diag.Transfers++;
                 if (n % 512 == 0) Diag.Aligned++;
                 if (n > Diag.MaxTransfer) Diag.MaxTransfer = n;
@@ -91,6 +112,11 @@ static class Program
         while (!stop.IsCancellationRequested)
         {
             if (!phone.Carrier()) { failure ??= new IOException("carrier off"); break; }
+            if (Environment.TickCount64 - Volatile.Read(ref lastRx) > SilenceLimitMs)
+            {
+                failure ??= new IOException("phone has carrier but sends nothing");
+                break;
+            }
             if (verbose && ++tick % 5 == 0)
             {
                 Log($"rx {rxFrames} frames {rxBytes >> 10} KiB, tx {txFrames} frames {txBytes >> 10} KiB | " + Diag.Take());
@@ -104,7 +130,19 @@ static class Program
         throw failure ?? new IOException("stopped");
     }
 
-    public static void Log(string s) => Console.WriteLine($"{DateTime.Now:HH:mm:ss} {s}");
+    // Windowless program: the log file is the only output unless stdout is redirected.
+    public static void Log(string s)
+    {
+        string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {s}";
+        Console.WriteLine(line);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+            if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 1_000_000) File.Delete(LogPath);
+            File.AppendAllText(LogPath, line + Environment.NewLine);
+        }
+        catch (IOException) { }
+    }
 }
 
 sealed class PhoneNotFoundException : Exception;
@@ -143,10 +181,13 @@ sealed unsafe class Phone : IDisposable
     {
         _file = file; _usb = usb; _ncm = ncm;
         Mac = Control(true, CmdGetMac, 6);
-        if (ncm) Control(false, CmdEnableNcm, 0);
+        // Same order as Linux's ipheth: alternate setting first, then NCM.
         Check(WinUsb_SetCurrentAlternateSetting(_usb, 1), "select alternate setting");
+        if (ncm) Control(false, CmdEnableNcm, 0);
         byte on = 1;
         WinUsb_SetPipePolicy(_usb, EpOut, 0x01 /* SHORT_PACKET_TERMINATE */, 1, &on);
+        int writeTimeoutMs = 5000;   // a phone that stopped draining must not block the sender forever
+        WinUsb_SetPipePolicy(_usb, EpOut, 0x03 /* PIPE_TRANSFER_TIMEOUT */, 4, &writeTimeoutMs);
     }
 
     public static Phone Open(bool ncm)
@@ -163,6 +204,8 @@ sealed unsafe class Phone : IDisposable
         try { return new Phone(file, usb, ncm); }
         catch { WinUsb_Free(usb); file.Dispose(); throw; }
     }
+
+    public static bool Present() => FindPath() != null;
 
     static string? FindPath()
     {
