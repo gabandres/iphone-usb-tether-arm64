@@ -105,8 +105,16 @@ static class Program
             Log("waiting for carrier (is Personal Hotspot on?)");
             while (!phone.Carrier()) Thread.Sleep(1000);
         }
+        // Bring the adapter up only once the phone really sends: a locked phone reports carrier but
+        // passes nothing, and an "up" adapter would take the default route away from Wi-Fi.
+        var first = new byte[65536];
+        phone.SetReadTimeout(15_000);
+        int firstLength = phone.Read(first);
+        phone.SetReadTimeout(0);
         tap.SetConnected(true);
-        Log("carrier on");
+        Log("link up");
+        foreach (var (offset, length) in phone.Frames(first, firstLength)) tap.Write(first.AsSpan(offset, length));
+        Volatile.Write(ref lastRx, Environment.TickCount64);
         rx.Start(); tx.Start();
         int tick = 0;
         while (!stop.IsCancellationRequested)
@@ -228,6 +236,9 @@ sealed unsafe class Phone : IDisposable
             Check(WinUsb_ControlTransfer(_usb, setup, p, length, out int n, IntPtr.Zero), $"control request 0x{request:x2}");
         return data[..length];
     }
+
+    /// <summary>0 = wait forever.</summary>
+    public void SetReadTimeout(int ms) => WinUsb_SetPipePolicy(_usb, EpIn, 0x03 /* PIPE_TRANSFER_TIMEOUT */, 4, &ms);
 
     public bool Carrier() => Control(true, CmdCarrierCheck, 3)[0] == 0x04;
 
