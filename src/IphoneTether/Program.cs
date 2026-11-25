@@ -45,8 +45,9 @@ static class Program
             catch (Exception e)
             {
                 Log($"link down: {e.Message}");
-                // Still plugged in but silent: iOS holds USB data back until the phone is unlocked.
-                if (Phone.Present()) Log("phone is connected but passes no traffic: unlock it (retrying)");
+                // Plugged in but silent (a timeout, not a removed device): iOS is holding USB data back.
+                if (e is SilentPhoneException)
+                    Log("phone is plugged in but passes no traffic: unlock it, or replug it unlocked (retrying)");
                 settle = true;
             }
             tap.SetConnected(false);
@@ -124,7 +125,7 @@ static class Program
             if (!phone.Carrier()) { failure ??= new IOException("carrier off"); break; }
             if (Environment.TickCount64 - Volatile.Read(ref lastRx) > SilenceLimitMs)
             {
-                failure ??= new IOException("phone has carrier but sends nothing");
+                failure ??= new SilentPhoneException("phone has carrier but sends nothing");
                 break;
             }
             if (verbose && ++tick % 5 == 0)
@@ -156,6 +157,9 @@ static class Program
 }
 
 sealed class PhoneNotFoundException : Exception;
+
+/// <summary>The phone is there and answers control requests, but its data endpoints time out.</summary>
+sealed class SilentPhoneException(string message) : IOException(message);
 
 static class Diag
 {
@@ -294,7 +298,10 @@ sealed unsafe class Phone : IDisposable
 
     static void Check(bool ok, string what)
     {
-        if (!ok) throw new IOException($"USB {what} failed (error {Marshal.GetLastWin32Error()})");
+        if (ok) return;
+        int error = Marshal.GetLastWin32Error();
+        if (error == 121 /* ERROR_SEM_TIMEOUT */) throw new SilentPhoneException($"USB {what} timed out");
+        throw new IOException($"USB {what} failed (error {error})");
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]

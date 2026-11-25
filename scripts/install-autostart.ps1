@@ -9,9 +9,15 @@ $TaskName = 'iPhone USB tether'
 $dir = Join-Path $env:LOCALAPPDATA 'iphone-usb-tether'
 $root = Split-Path $PSScriptRoot -Parent
 
+# Build into a staging folder first: a failed build must not take the running bridge down.
+$stage = "$dir.new"
+dotnet publish (Join-Path $root 'src\IphoneTether') -c Release -o $stage --nologo -v q
+if ($LASTEXITCODE) { throw 'publish failed; the running bridge was left alone' }
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-dotnet publish (Join-Path $root 'src\IphoneTether') -c Release -o $dir --nologo -v q
-if ($LASTEXITCODE) { throw 'publish failed' }
+Get-Process iphone-tether -ErrorAction SilentlyContinue | Where-Object Path -like "$dir\*" | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $dir | Out-Null
+Copy-Item "$stage\*" $dir -Recurse -Force
+Remove-Item $stage -Recurse -Force
 
 $action = New-ScheduledTaskAction -Execute "$dir\iphone-tether.exe"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
