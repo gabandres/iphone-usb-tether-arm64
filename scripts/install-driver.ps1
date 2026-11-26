@@ -1,5 +1,6 @@
 <#
-Run elevated, with the iPhone connected and Personal Hotspot on.
+Run elevated, with the iPhone(s) connected and Personal Hotspot on. Safe to rerun: it only
+changes what is not already set up.
  1. Makes Windows select the iPhone's USB configuration 4 (the one with the Ethernet interface)
     and power-cycles the USB port so it takes effect.
  2. Installs Windows' own WinUSB driver (winusb.inf, Microsoft-signed) on the Ethernet interface
@@ -134,33 +135,40 @@ public static class TetherSetup
 '@
 
 try {
-    $phone = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_05AC&PID_12A8\\' } | Select-Object -First 1
-    if (-not $phone) { throw 'No iPhone connected.' }
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($phone.InstanceId)\Device Parameters"
     $usbDeviceClass = [guid]'{88BAE032-5A81-49f0-BC3D-A4FF138216D6}'
-    # Apple's AppleLowerFilter re-selects configuration 3 (no Ethernet) on every plug-in, so detach it
-    # from this phone. Reinstalling Apple's driver puts it back; rerun this script then.
-    $filters = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\$($phone.InstanceId)").LowerFilters
-    if ($filters) { "detaching lower filters: $filters"; [TetherSetup]::ClearLowerFilters($phone.InstanceId, $usbDeviceClass) }
-    Set-ItemProperty $key -Name OriginalConfigurationValue -Value 3 -Type DWord   # index 3 = configuration 4
+    # Every iPhone on USB (Apple's driver lists product IDs 0x1290-0x12AC).
+    $phones = @(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_05AC&PID_12[9A][0-9A-F]\\' })
+    if (-not $phones) { throw 'No iPhone connected.' }
+    foreach ($phone in $phones) {
+        "--- $($phone.InstanceId)"
+        $usbId = ($phone.InstanceId -split '\\')[1]
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($phone.InstanceId)\Device Parameters"
+        # Apple's AppleLowerFilter re-selects configuration 3 (no Ethernet) on every plug-in, so detach it
+        # from this phone. Reinstalling Apple's driver puts it back; rerun this script then.
+        $filters = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\$($phone.InstanceId)").LowerFilters
+        if ($filters) { "detaching lower filters: $filters"; [TetherSetup]::ClearLowerFilters($phone.InstanceId, $usbDeviceClass) }
+        Set-ItemProperty $key -Name OriginalConfigurationValue -Value 3 -Type DWord   # index 3 = configuration 4
 
-    $ether = { Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_05AC&PID_12A8&MI_02\\' } | Select-Object -First 1 }
-    if (-not (& $ether)) {
-        $hub = (Get-PnpDeviceProperty -InstanceId $phone.InstanceId -KeyName DEVPKEY_Device_Parent).Data
-        $port = (Get-PnpDeviceProperty -InstanceId $phone.InstanceId -KeyName DEVPKEY_Device_Address).Data
-        "cycling port $port on $hub"
-        [TetherSetup]::CyclePort('\\?\' + $hub.Replace('\', '#') + '#{f18a0e88-c30c-11d0-8815-00a0c906bed8}', $port)
-        foreach ($i in 1..20) { Start-Sleep 1; if (& $ether) { break } }
+        $ether = { Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "USB\$usbId&MI_02\*" } | Select-Object -First 1 }
+        if (-not (& $ether)) {
+            $hub = (Get-PnpDeviceProperty -InstanceId $phone.InstanceId -KeyName DEVPKEY_Device_Parent).Data
+            $port = (Get-PnpDeviceProperty -InstanceId $phone.InstanceId -KeyName DEVPKEY_Device_Address).Data
+            "cycling port $port on $hub"
+            [TetherSetup]::CyclePort('\\?\' + $hub.Replace('\', '#') + '#{f18a0e88-c30c-11d0-8815-00a0c906bed8}', $port)
+            foreach ($i in 1..20) { Start-Sleep 1; if (& $ether) { break } }
+        }
+        $dev = & $ether
+        if (-not $dev) { "Ethernet interface (MI_02) did not appear. Is Personal Hotspot on?"; continue }
+
+        $devKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
+        $bound = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)").Service -eq 'WINUSB' -and
+            ((Get-ItemProperty $devKey -ErrorAction SilentlyContinue).DeviceInterfaceGUIDs -contains $InterfaceGuid)
+        if ($bound) { 'WinUSB already bound: nothing to do'; continue }
+        New-ItemProperty $devKey -Name DeviceInterfaceGUIDs -PropertyType MultiString -Value $InterfaceGuid -Force | Out-Null
+        [TetherSetup]::ForceInstall($dev.InstanceId, "$env:windir\INF\winusb.inf", 'WinUsb')
+        pnputil /restart-device $dev.InstanceId
+        Start-Sleep 3
     }
-    "config index now: $((Get-ItemProperty $key).OriginalConfigurationValue)"
-    $dev = & $ether
-    if (-not $dev) { throw 'Ethernet interface (MI_02) did not appear. Is Personal Hotspot on?' }
-
-    $devKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
-    New-ItemProperty $devKey -Name DeviceInterfaceGUIDs -PropertyType MultiString -Value $InterfaceGuid -Force | Out-Null
-    [TetherSetup]::ForceInstall($dev.InstanceId, "$env:windir\INF\winusb.inf", 'WinUsb')
-    pnputil /restart-device $dev.InstanceId
-    Start-Sleep 3
 }
 catch { "FAILED: $_"; $_.ScriptStackTrace }
 finally {

@@ -26,11 +26,22 @@ static class Program
         Log($"adapter '{AdapterName}' open");
         // Give the phone time after every arrival or lost link before opening it again.
         bool settle = false;
+        int pollsWithoutEthernet = 0;
         while (true)
         {
             try
             {
-                if (!Phone.Present()) { settle = true; throw new PhoneNotFoundException(); }
+                if (!Phone.Present())
+                {
+                    // An iPhone on USB whose Ethernet interface never shows up needs the user.
+                    pollsWithoutEthernet = Phone.AnyIphonePluggedIn() ? pollsWithoutEthernet + 1 : 0;
+                    if (pollsWithoutEthernet == 10)
+                        Log("an iPhone is plugged in but offers no Ethernet interface: turn on Personal Hotspot; " +
+                            "if it is on, run scripts\\install-driver.ps1 again (needed for a new phone or after an Apple driver update)");
+                    settle = true;
+                    throw new PhoneNotFoundException();
+                }
+                pollsWithoutEthernet = 0;
                 if (settle)
                 {
                     Log("phone arrived, letting it settle");
@@ -42,6 +53,12 @@ static class Program
                 Run(phone, tap, verbose);
             }
             catch (PhoneNotFoundException) { }
+            catch (TapException e)
+            {
+                // The adapter handle is no use any more: exit and let the task restart the bridge.
+                Log($"adapter failed: {e.Message}; exiting");
+                return 1;
+            }
             catch (Exception e)
             {
                 Log($"link down: {e.Message}");
@@ -50,7 +67,8 @@ static class Program
                     Log("phone is plugged in but passes no traffic: unlock it, or replug it unlocked (retrying)");
                 settle = true;
             }
-            tap.SetConnected(false);
+            try { tap.SetConnected(false); }
+            catch (TapException e) { Log($"adapter failed: {e.Message}; exiting"); return 1; }
             Thread.Sleep(2000);
         }
     }
@@ -152,18 +170,20 @@ static class Program
             if (File.Exists(LogPath) && new FileInfo(LogPath).Length > 1_000_000) File.Delete(LogPath);
             File.AppendAllText(LogPath, line + Environment.NewLine);
         }
-        catch (IOException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // logging must never stop the bridge
     }
 }
 
 sealed class PhoneNotFoundException : Exception;
+
+sealed class TapException(string message) : IOException(message);
 
 /// <summary>The phone is there and answers control requests, but its data endpoints time out.</summary>
 sealed class SilentPhoneException(string message) : IOException(message);
 
 static class Diag
 {
-    public static long Transfers, Aligned, Empty, Trailing, MaxTransfer;
+    public static long Transfers, Aligned, Empty, MaxTransfer;
     public static double MaxTapWriteMs, MaxUsbWriteMs;
     public static void Note(ref double max, long t0)
     {
@@ -172,8 +192,8 @@ static class Diag
     }
     public static string Take()
     {
-        string s = $"transfers {Transfers} aligned512 {Aligned} empty {Empty} trailing {Trailing} maxXfer {MaxTransfer} maxTapWrite {MaxTapWriteMs:F1}ms maxUsbWrite {MaxUsbWriteMs:F1}ms";
-        Transfers = Aligned = Empty = Trailing = MaxTransfer = 0; MaxTapWriteMs = MaxUsbWriteMs = 0;
+        string s = $"transfers {Transfers} aligned512 {Aligned} empty {Empty} maxXfer {MaxTransfer} maxTapWrite {MaxTapWriteMs:F1}ms maxUsbWrite {MaxUsbWriteMs:F1}ms";
+        Transfers = Aligned = Empty = MaxTransfer = 0; MaxTapWriteMs = MaxUsbWriteMs = 0;
         return s;
     }
 }
@@ -221,14 +241,22 @@ sealed unsafe class Phone : IDisposable
 
     public static bool Present() => FindPath() != null;
 
-    static string? FindPath()
+    static readonly Guid UsbDeviceInterface = new("A5DCBF10-6530-11D2-901F-00C04FB951ED");
+
+    /// <summary>True when any iPhone (Apple vendor ID, product IDs 0x1290-0x12AF) is on USB.</summary>
+    public static bool AnyIphonePluggedIn() =>
+        Interfaces(UsbDeviceInterface).Any(p =>
+            p.Contains("vid_05ac&pid_129", StringComparison.OrdinalIgnoreCase) ||
+            p.Contains("vid_05ac&pid_12a", StringComparison.OrdinalIgnoreCase));
+
+    static string? FindPath() => Interfaces(InterfaceGuid).FirstOrDefault();
+
+    static string[] Interfaces(Guid g)
     {
-        Guid g = InterfaceGuid;
-        if (CM_Get_Device_Interface_List_SizeW(out int len, ref g, null, 0) != 0 || len <= 1) return null;
+        if (CM_Get_Device_Interface_List_SizeW(out int len, ref g, null, 0) != 0 || len <= 1) return [];
         var buf = new char[len];
-        if (CM_Get_Device_Interface_ListW(ref g, null, buf, len, 0) != 0) return null;
-        string first = new string(buf).Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-        return first.Length > 0 ? first : null;
+        if (CM_Get_Device_Interface_ListW(ref g, null, buf, len, 0) != 0) return [];
+        return new string(buf).Split('\0', StringSplitOptions.RemoveEmptyEntries);
     }
 
     byte[] Control(bool deviceToHost, byte request, ushort length)
@@ -256,31 +284,7 @@ sealed unsafe class Phone : IDisposable
         return n;
     }
 
-    /// <summary>Ethernet frames inside one bulk-IN transfer, as (offset, length).</summary>
-    public IEnumerable<(int, int)> Frames(byte[] buf, int n)
-    {
-        if (!_ncm)
-        {
-            // Legacy framing: two bytes of padding, then one frame.
-            if (n > 2 + 14) yield return (2, n - 2);
-            yield break;
-        }
-        // NCM: NTH16 header, then a chain of NDP16 tables listing datagram offset/length pairs.
-        if (n < 12 || BitConverter.ToUInt32(buf, 0) != 0x484D434E /* "NCMH" */) yield break;
-        if (BitConverter.ToUInt16(buf, 8) < n) Diag.Trailing++;
-        int ndp = BitConverter.ToUInt16(buf, 10);
-        while (ndp != 0 && ndp + 8 <= n && BitConverter.ToUInt32(buf, ndp) == 0x304D434E /* "NCM0" */)
-        {
-            int ndpLen = BitConverter.ToUInt16(buf, ndp + 4);
-            for (int e = ndp + 8; e + 4 <= ndp + ndpLen && e + 4 <= n; e += 4)
-            {
-                int off = BitConverter.ToUInt16(buf, e), len = BitConverter.ToUInt16(buf, e + 2);
-                if (off == 0 || len == 0) break;
-                if (off + len <= n && len >= 14) yield return (off, len);
-            }
-            ndp = BitConverter.ToUInt16(buf, ndp + 6);
-        }
-    }
+    public List<(int Offset, int Length)> Frames(byte[] buf, int n) => Framing.Frames(buf, n, _ncm);
 
     public void Write(ReadOnlySpan<byte> frame)
     {
@@ -366,9 +370,9 @@ sealed unsafe class Tap : IDisposable
         if (!ok)
         {
             int err = Marshal.GetLastWin32Error();
-            if (err != 997 /* ERROR_IO_PENDING */) throw new IOException($"TAP {what} failed (error {err})");
+            if (err != 997 /* ERROR_IO_PENDING */) throw new TapException($"TAP {what} failed (error {err})");
         }
-        if (!GetOverlappedResult(_h, ov, out n, true)) throw new IOException($"TAP {what} failed (error {Marshal.GetLastWin32Error()})");
+        if (!GetOverlappedResult(_h, ov, out n, true)) throw new TapException($"TAP {what} failed (error {Marshal.GetLastWin32Error()})");
         return n;
     }
 

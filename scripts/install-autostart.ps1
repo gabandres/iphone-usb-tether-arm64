@@ -14,7 +14,12 @@ $stage = "$dir.new"
 dotnet publish (Join-Path $root 'src\IphoneTether') -c Release -o $stage --nologo -v q
 if ($LASTEXITCODE) { throw 'publish failed; the running bridge was left alone' }
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Get-Process iphone-tether -ErrorAction SilentlyContinue | Where-Object Path -like "$dir\*" | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+# The bridge installed here (and only that one) must be gone before its files are replaced. It can
+# outlive its task, for example when the task was unregistered while it ran.
+$mine = { Get-Process iphone-tether -ErrorAction SilentlyContinue | Where-Object Path -like "$dir\*" }
+& $mine | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+& $mine | Stop-Process -Force
+& $mine | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $dir | Out-Null
 Copy-Item "$stage\*" $dir -Recurse -Force
 Remove-Item $stage -Recurse -Force
@@ -25,6 +30,12 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # bridge on a busy machine: ping to the phone went from 1 ms to hundreds.
 $settings = New-ScheduledTaskSettingsSet -Priority 4 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction Stop | Out-Null
+}
+catch {
+    # A task of this name created from an elevated shell cannot be replaced from a normal one.
+    Write-Warning "Could not update the task definition ($_). The existing task is started as it is; to replace it, run once elevated: Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
+}
 Start-ScheduledTask -TaskName $TaskName
 "Task '$TaskName' registered and started."

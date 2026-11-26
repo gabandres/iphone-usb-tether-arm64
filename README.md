@@ -32,7 +32,8 @@ phone was about 1 ms (max 6) over USB against about 16 ms (max 38) over Wi-Fi.
 ## Setup
 
 1. Install Apple Devices, open it once, plug in the phone and trust the PC.
-2. Elevated, with the phone connected: `scripts\install-driver.ps1`
+2. Elevated, with the phone connected: `scripts\install-driver.ps1` (handles every iPhone that is
+   plugged in; safe to rerun)
 3. Elevated, once: `scripts\install-tap.ps1`
 4. `scripts\install-autostart.ps1` to run it at every logon. The bridge has no window; it logs to
    `%LOCALAPPDATA%\iphone-usb-tether\bridge.log` (`-v` adds traffic counters every 5 seconds).
@@ -55,11 +56,29 @@ Face ID & Passcode > Allow Access When Locked > Accessories).
   device interface GUID the bridge opens.
 
 These are per-device settings: a different phone, or a reinstall of Apple's driver, needs the script
-run again. The effect of detaching the filter on photo import and sync was not tested.
+run again. The bridge notices: when an iPhone is plugged in for 20 seconds without an Ethernet
+interface, it logs that the script (or Personal Hotspot) is needed. The effect of detaching the
+filter on photo import and sync was not tested.
 
 `install-tap.ps1`
 - Downloads TAP-Windows 9.27.0 from the OpenVPN release (pinned SHA-256), installs the ARM64 driver,
   names the adapter "iPhone USB" and gives it a low interface metric so it is preferred over Wi-Fi.
+
+## Behaviour worth knowing
+
+- The adapter comes up only after the phone sends its first frame, so a silent phone never takes
+  the default route away from Wi-Fi.
+- The bridge raises itself to high priority and the task runs at normal priority. At Task
+  Scheduler's default (below normal) a busy machine pushed ping to the phone from under 1 ms to
+  over a second.
+- The bridge runs as a logon task of the user. A task running as SYSTEM from boot was tried and
+  dropped: on battery at 17 % it stayed "Queued" and never started.
+- Not tested: sleep/resume, turning the hotspot off and on, a reboot.
+
+## Tests
+
+`dotnet test tests\IphoneTether.Tests` covers the frame parser (`Framing.cs`), the only code that
+interprets bytes from the phone. CI builds the bridge and runs the tests on every push.
 
 ## Protocol
 
